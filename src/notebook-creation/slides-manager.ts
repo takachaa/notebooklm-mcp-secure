@@ -45,6 +45,12 @@ import { SharedContextManager } from "../session/shared-context-manager.js";
 import { log } from "../utils/logger.js";
 import { randomDelay, humanType } from "../utils/stealth-utils.js";
 import { applySourceFilter, SourceSelectionError } from "./source-selection.js";
+import {
+  clickMatRadioByValue,
+  clickMatToggleByLabel,
+  clickDialogSubmitButton,
+  pickMatSelectOption,
+} from "./material-clicks.js";
 import fs from "fs";
 import path from "path";
 
@@ -187,21 +193,25 @@ export class SlidesManager {
     await page.waitForSelector('mat-dialog-container textarea[aria-label*="スライド" i], mat-dialog-container textarea[aria-label*="slide" i], mat-dialog-container mat-radio-group', { timeout: 10000 });
     await randomDelay(600, 1000);
 
-    // 1. Format radio
+    // 1. Format radio (Material radios ignore programmatic JS clicks; need
+    //    a trusted Playwright click to update the form control.)
     if (options.format) {
       const value = options.format === "presenter" ? "2" : "1";
-      await page.evaluate((val: string) => {
+      const r = await clickMatRadioByValue(page, "mat-dialog-container", value);
+      if (!r.clicked) {
+        throw new Error(`Could not select format '${options.format}' (value=${value}): ${r.reason}`);
+      }
+      const checked = await page.evaluate((val: string) => {
         // @ts-expect-error - DOM types
-        const radios = document.querySelectorAll('mat-dialog-container mat-radio-button input[type="radio"]');
-        for (const r of radios) {
-          if ((r as any).value === val) {
-            // Click the surrounding mat-radio-button to respect Angular
-            const container = (r as any).closest('mat-radio-button');
-            (container || r as any).click();
-            return;
-          }
+        const inputs = document.querySelectorAll('mat-dialog-container mat-radio-button input[type="radio"]');
+        for (const i of inputs) {
+          if ((i as any).value === val) return (i as any).checked === true;
         }
+        return false;
       }, value);
+      if (!checked) {
+        throw new Error(`Format '${options.format}' click registered but radio not checked.`);
+      }
       await randomDelay(300, 500);
     }
 
@@ -209,24 +219,19 @@ export class SlidesManager {
     if (options.length) {
       const label = options.length === "short" ? "短め" : "デフォルト";
       const enLabel = options.length === "short" ? "short" : "default";
-      await page.evaluate((labels: string[]) => {
-        // @ts-expect-error - DOM types
-        const toggles = document.querySelectorAll('mat-dialog-container mat-button-toggle');
-        for (const t of toggles) {
-          const txt = ((t as any).textContent || '').trim().toLowerCase();
-          if (labels.some(l => txt.includes(l.toLowerCase()))) {
-            const btn = (t as any).querySelector('button, [role="button"]') || t;
-            btn.click();
-            return;
-          }
-        }
-      }, [label, enLabel]);
+      const r = await clickMatToggleByLabel(page, "mat-dialog-container", [label, enLabel]);
+      if (!r.clicked) {
+        throw new Error(`Could not select length '${options.length}': ${r.reason}`);
+      }
       await randomDelay(300, 500);
     }
 
     // 3. Language mat-select
     if (options.language) {
-      await this.selectMatSelectOption(page, options.language);
+      const r = await pickMatSelectOption(page, "mat-dialog-container", options.language);
+      if (!r.clicked) {
+        log.warning(`    Could not pick language '${options.language}': ${r.reason}`);
+      }
     }
 
     // 4. Description textarea
@@ -253,64 +258,12 @@ export class SlidesManager {
       void descSelector; // reserved for future humanType use
     }
 
-    // 5. Click Generate (生成) — primary unelevated button in dialog-actions
-    const clicked = await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const buttons = document.querySelectorAll('mat-dialog-container button');
-      for (const b of buttons) {
-        if ((b as any).disabled) continue;
-        const text = ((b as any).textContent || '').trim();
-        const cls = ((b as any).className || '').toString();
-        if (cls.includes('mdc-button--unelevated') || cls.includes('button-color--primary')) {
-          // Skip close/cancel
-          if (/close|cancel|キャンセル|閉じる/i.test(text)) continue;
-          (b as any).click();
-          return text;
-        }
-      }
-      // Fallback: text match "生成" / "Generate"
-      for (const b of buttons) {
-        const text = ((b as any).textContent || '').trim();
-        if (/^(生成|create|generate)$/i.test(text)) {
-          (b as any).click();
-          return text;
-        }
-      }
-      return '';
-    });
-    if (!clicked) throw new Error("Could not find the Generate button in customize dialog");
-    log.dim(`    Submitted customize dialog via: ${clicked}`);
-  }
-
-  /** Shared helper to pick a mat-select option by its visible text (locale-agnostic). */
-  private async selectMatSelectOption(page: Page, targetText: string): Promise<void> {
-    // Open first mat-select in the dialog
-    const opened = await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const sel = document.querySelector('mat-dialog-container mat-select');
-      if (!sel) return false;
-      (sel as any).click();
-      return true;
-    });
-    if (!opened) return;
-    // Wait for overlay panel
-    try {
-      await page.waitForSelector('.cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]', { timeout: 5000 });
-    } catch {
-      return;
+    // 5. Click Generate (生成) via trusted Playwright click
+    const submit = await clickDialogSubmitButton(page);
+    if (!submit.clicked) {
+      throw new Error(`Could not click Generate button: ${submit.reason}`);
     }
-    await page.evaluate((target: string) => {
-      // @ts-expect-error - DOM types
-      const opts = document.querySelectorAll('.cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]');
-      for (const o of opts) {
-        const txt = ((o as any).textContent || '').trim();
-        if (txt === target || txt.includes(target)) {
-          (o as any).click();
-          return;
-        }
-      }
-    }, targetText);
-    await randomDelay(400, 700);
+    log.dim(`    Submitted customize dialog via: ${submit.buttonText ?? '<unknown>'}`);
   }
 
   private async checkSlidesStatusInternal(page: Page): Promise<SlidesStatus> {
