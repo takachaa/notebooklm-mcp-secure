@@ -217,46 +217,88 @@ export class ResearchManager {
     }, selector);
   }
 
-  private async isDiscoveryContainerVisible(page: Page): Promise<boolean> {
+  /**
+   * Detect a *completed* research result inside the research widget.
+   *
+   * `.source-discovery-container` is the research widget itself (always
+   * present when the source panel is open — contains the query textarea and
+   * mode/corpus selectors). A *completed discovery result* is only present
+   * when NotebookLM has surfaced candidate sources, which we identify by a
+   * visible Import button (jslog 282708). Treating the whole container as
+   * "stale state" is wrong — doing so would try to destroy the query widget
+   * itself, which also holds the textarea we need.
+   */
+  private async hasCompletedDiscoveryResult(page: Page): Promise<boolean> {
     return await page.evaluate(() => {
       // @ts-expect-error - DOM types
       const dc = document.querySelector('.source-discovery-container') as any;
-      return !!(dc && dc.offsetParent);
+      if (!dc || !dc.offsetParent) return false;
+      const importBtn = dc.querySelector('button[jslog^="282708"]');
+      const dismissBtn = dc.querySelector('button[jslog^="282707"]');
+      return !!(
+        (importBtn && (importBtn as any).offsetParent) ||
+        (dismissBtn && (dismissBtn as any).offsetParent)
+      );
     });
   }
 
-  private async waitForDiscoveryContainerHidden(page: Page, timeoutMs: number): Promise<boolean> {
+  private async waitForCompletionCleared(page: Page, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (!(await this.isDiscoveryContainerVisible(page))) return true;
+      if (!(await this.hasCompletedDiscoveryResult(page))) return true;
       await page.waitForTimeout(300);
     }
     return false;
   }
 
   /**
-   * Clear any pre-existing `.source-discovery-container` so a freshly-submitted
+   * After clicking submit, confirm NotebookLM accepted the query. Signals:
+   * - Query textarea cleared (NotebookLM empties it on submit), OR
+   * - A result-section button (Import/Dismiss/Show) appeared inside the widget, OR
+   * - A loading/progress indicator is visible inside the widget
+   */
+  private async waitForSubmitRegistered(page: Page, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const registered = await page.evaluate(() => {
+        // @ts-expect-error - DOM types
+        const qb = document.querySelector('textarea.query-box-textarea') as any;
+        if (qb && (qb.value || '').length === 0) return true;
+        // @ts-expect-error - DOM types
+        const dc = document.querySelector('.source-discovery-container');
+        if (!dc) return false;
+        if (dc.querySelector('button[jslog^="282706"], button[jslog^="282707"], button[jslog^="282708"]')) return true;
+        if (dc.querySelector('[role="progressbar"], mat-spinner, mat-progress-bar, [class*="loading"], [class*="progress-"]')) return true;
+        return false;
+      });
+      if (registered) return true;
+      await page.waitForTimeout(400);
+    }
+    return false;
+  }
+
+  /**
+   * Clear a pre-existing completed discovery result so a freshly-submitted
    * query produces an unambiguously new result.
    *
-   * NotebookLM persists the discovery container server-side: dismissing or
-   * importing was previously the only way to clear it. In April 2026 the
-   * jslog 282707 (削除) click frequently fails to remove the container, so
-   * this helper escalates through several strategies and verifies the result.
+   * NotebookLM persists completed discovery results server-side: dismissing
+   * or importing is the only way to remove them. Without this clear step a
+   * stale result makes `get_source_discovery_status` return "completed" for
+   * research that never ran in the current session, and `triggerResearch`
+   * cannot tell whether a new submit actually landed.
    *
-   * Without this, a stale "completed" container makes get_source_discovery_status
-   * lie ("completed" returned for research that never actually ran in this
-   * session), and triggerResearch's `waitForSelector('.source-discovery-container')`
-   * succeeds against the stale node — so the tool reports `triggered: true`
-   * even when the new submit was a no-op.
+   * Only the completion section (Import/Dismiss buttons) is targeted — the
+   * research widget itself (query textarea, mode/corpus selectors) must
+   * remain intact for the new submit.
    */
-  private async clearDiscoveryContainer(
+  private async clearStaleCompletion(
     page: Page
   ): Promise<{ wasPresent: boolean; cleared: boolean; method?: string }> {
-    if (!(await this.isDiscoveryContainerVisible(page))) {
+    if (!(await this.hasCompletedDiscoveryResult(page))) {
       return { wasPresent: false, cleared: true };
     }
 
-    log.info("  🧹 Clearing pre-existing discovery container before new research");
+    log.info("  🧹 Clearing pre-existing completed discovery before new research");
 
     // 1) Real click on Dismiss (jslog 282707, text 削除)
     const byJslog = await this.clickButton(
@@ -264,7 +306,7 @@ export class ResearchManager {
       '.source-discovery-container button[jslog^="282707"]',
       3000
     );
-    if (byJslog && (await this.waitForDiscoveryContainerHidden(page, 6000))) {
+    if (byJslog && (await this.waitForCompletionCleared(page, 6000))) {
       return { wasPresent: true, cleared: true, method: "dismiss-jslog" };
     }
 
@@ -286,26 +328,8 @@ export class ResearchManager {
       }
       return false;
     });
-    if (byText && (await this.waitForDiscoveryContainerHidden(page, 4000))) {
+    if (byText && (await this.waitForCompletionCleared(page, 4000))) {
       return { wasPresent: true, cleared: true, method: "dismiss-text" };
-    }
-
-    // 3) Escape key (sometimes closes overlays/menus that block the click)
-    await page.keyboard.press("Escape").catch(() => {});
-    if (await this.waitForDiscoveryContainerHidden(page, 2000)) {
-      return { wasPresent: true, cleared: true, method: "escape" };
-    }
-
-    // 4) Force-remove from DOM as a last resort. The server-side state still
-    // contains the old discovery, but submitting a new query replaces it,
-    // so the user gets correct fresh results going forward.
-    await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const dc = document.querySelector('.source-discovery-container') as any;
-      if (dc) dc.remove();
-    });
-    if (await this.waitForDiscoveryContainerHidden(page, 1000)) {
-      return { wasPresent: true, cleared: true, method: "force-remove" };
     }
 
     return { wasPresent: true, cleared: false };
@@ -368,11 +392,13 @@ export class ResearchManager {
 
       const sourcesBefore = await this.countSources(page);
 
-      // Clear any stale discovery container left over from a previous research
-      // (NotebookLM persists this server-side). Without this step the new
-      // submit would land in a notebook that already has a "completed"
-      // container, and we cannot tell whether our submit actually went through.
-      const cleared = await this.clearDiscoveryContainer(page);
+      // Clear any stale completed discovery left over from a previous research
+      // (NotebookLM persists it server-side). Without this step the new submit
+      // would land next to a "completed" section whose Import button is still
+      // visible, so callers cannot tell whether a new research actually started.
+      // Only the completion section is removed; the research widget itself
+      // (including the query textarea) stays intact.
+      const cleared = await this.clearStaleCompletion(page);
       if (cleared.wasPresent && !cleared.cleared) {
         return {
           success: false, triggered: false, query: options.query,
@@ -381,7 +407,11 @@ export class ResearchManager {
         };
       }
       if (cleared.wasPresent && cleared.method && cleared.method !== "dismiss-jslog") {
-        log.warning(`  ⚠️  Cleared stale container via fallback (${cleared.method}); selectors may need an update`);
+        log.warning(`  ⚠️  Cleared stale completion via fallback (${cleared.method}); selectors may need an update`);
+      }
+      if (cleared.wasPresent) {
+        // Give the widget a moment to settle after dismiss before typing
+        await randomDelay(400, 800);
       }
 
       // Switch mode if not default
@@ -427,16 +457,17 @@ export class ResearchManager {
         };
       }
 
-      // We just cleared any pre-existing container, so the appearance of
-      // `.source-discovery-container` here proves the new submit went through.
-      const appeared = await page.waitForSelector('.source-discovery-container', { timeout: 20000, state: 'visible' })
-        .then(() => true)
-        .catch(() => false);
-      if (!appeared) {
+      // NotebookLM clears the query textarea after a successful submit and
+      // begins rendering the running/completed research section. Use either
+      // signal (empty textarea or a result-section button) to confirm the
+      // submit actually registered — the widget's .source-discovery-container
+      // is always present, so its existence alone is not proof.
+      const submitConfirmed = await this.waitForSubmitRegistered(page, 20000);
+      if (!submitConfirmed) {
         return {
           success: false, triggered: false, query: options.query,
           mode, corpus, sourcesBefore,
-          error: "Submit clicked but the discovery container did not appear within 20s — research likely did not start.",
+          error: "Submit clicked but no running/completed indicator appeared within 20s — research likely did not start.",
         };
       }
 
@@ -477,12 +508,15 @@ export class ResearchManager {
         if (!dc || !dc.offsetParent) {
           return { status: 'idle', candidatesCount: 0, candidatePreview: [], headerText: '' };
         }
-        // Completed signal = Import button (jslog 282708) present and visible
+        // .source-discovery-container is the research widget itself and is
+        // always present when the source panel is open. Presence alone does
+        // NOT mean research is running — distinguish by result indicators.
         const importBtn = dc.querySelector('button[jslog^="282708"]');
+        const dismissBtn = dc.querySelector('button[jslog^="282707"]');
         const headerEl = dc.querySelector('[class*="header"], [class*="status"], [class*="title"]');
         const headerText = headerEl?.textContent?.replace(/\s+/g, ' ').trim().slice(0, 120) || '';
         if (importBtn && (importBtn as any).offsetParent) {
-          // Collect candidate titles
+          // Completion section visible — collect candidate titles
           const titles: string[] = [];
           const cards = dc.querySelectorAll('[class*="source-card"], [class*="discovered-source"], [class*="candidate"]');
           for (const c of cards) {
@@ -490,9 +524,7 @@ export class ResearchManager {
             const t = ((c as any).querySelector('[class*="title"], h3, h4')?.textContent || '').trim().slice(0, 100);
             if (t) titles.push(t);
           }
-          // Fallback: pull from full text as link-labeled segments
           if (titles.length === 0) {
-            // Scan all anchor/text titles inside the container
             const items = dc.querySelectorAll('a, [class*="result"] [class*="title"]');
             for (const a of items) {
               if (titles.length >= 5) break;
@@ -502,8 +534,17 @@ export class ResearchManager {
           }
           return { status: 'completed', candidatesCount: titles.length, candidatePreview: titles, headerText };
         }
-        // Discovery container is present but no Import button yet → still running
-        return { status: 'running', candidatesCount: 0, candidatePreview: [], headerText };
+        if (dismissBtn && (dismissBtn as any).offsetParent) {
+          // Dismiss visible but no Import yet — treat as completed-like state
+          return { status: 'completed', candidatesCount: 0, candidatePreview: [], headerText };
+        }
+        // Look for an explicit running/loading indicator
+        const runningIndicator = dc.querySelector('[role="progressbar"], mat-spinner, mat-progress-bar, [class*="loading"], [class*="progress-"]');
+        if (runningIndicator && (runningIndicator as any).offsetParent) {
+          return { status: 'running', candidatesCount: 0, candidatePreview: [], headerText };
+        }
+        // Widget present but no result, no progress → idle
+        return { status: 'idle', candidatesCount: 0, candidatePreview: [], headerText: '' };
       });
 
       log.success(`  Status: ${snapshot.status}${snapshot.candidatesCount ? ` (${snapshot.candidatesCount} candidates)` : ''}`);
@@ -547,15 +588,15 @@ export class ResearchManager {
       const titlesBefore = await this.listSourceTitles(page);
 
       if (action === "dismiss") {
-        // Use the same robust clear strategy as triggerResearch and verify
-        // the container actually disappears (the previous implementation
-        // accepted a no-op click and reported success regardless).
-        const cleared = await this.clearDiscoveryContainer(page);
+        // Use the same clear helper as triggerResearch and verify the
+        // Import/Dismiss buttons actually disappear (the previous
+        // implementation accepted a no-op click and reported success).
+        const cleared = await this.clearStaleCompletion(page);
         if (!cleared.cleared) {
           return {
             success: false, action, imported: false,
             sourcesBefore, sourcesAfter: sourcesBefore,
-            error: "Dismiss did not clear the discovery container.",
+            error: "Dismiss did not clear the completed discovery result.",
           };
         }
         log.success(`  ✅ dismissed (${cleared.method ?? 'noop'})`);
