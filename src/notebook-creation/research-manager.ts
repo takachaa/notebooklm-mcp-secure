@@ -384,6 +384,24 @@ export class ResearchManager {
         log.warning(`  ⚠️  Cleared stale container via fallback (${cleared.method}); selectors may need an update`);
       }
 
+      // After clearing, NotebookLM sometimes collapses the research section or
+      // re-renders the source panel, leaving the query box temporarily detached.
+      // Re-ensure the panel is open and wait for the query box to become
+      // interactable again before typing.
+      if (cleared.wasPresent) {
+        await randomDelay(400, 800);
+        await this.ensureSourcePanelOpen(page);
+        try {
+          await page.waitForSelector('textarea.query-box-textarea', { state: 'visible', timeout: 10000 });
+        } catch {
+          return {
+            success: false, triggered: false, query: options.query,
+            mode, corpus, sourcesBefore,
+            error: "Stale discovery cleared, but the query box did not reappear — UI may need manual interaction.",
+          };
+        }
+      }
+
       // Switch mode if not default
       if (mode !== "fast") {
         const modeSet = await this.setMode(page, mode);
