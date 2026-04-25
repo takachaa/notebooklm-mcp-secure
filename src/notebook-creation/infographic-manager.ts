@@ -44,6 +44,12 @@ import { SharedContextManager } from "../session/shared-context-manager.js";
 import { log } from "../utils/logger.js";
 import { randomDelay } from "../utils/stealth-utils.js";
 import { applySourceFilter, SourceSelectionError } from "./source-selection.js";
+import {
+  clickMatRadioByValue,
+  clickMatToggleByLabel,
+  clickDialogSubmitButton,
+  pickMatSelectOption,
+} from "./material-clicks.js";
 import fs from "fs";
 import path from "path";
 
@@ -200,47 +206,50 @@ export class InfographicManager {
     await page.waitForSelector('mat-dialog-container mat-radio-group', { timeout: 10000 });
     await randomDelay(600, 1000);
 
-    // 1. Style radio by numeric value (locale-independent)
+    // 1. Style radio by numeric value (locale-independent). Material radios
+    // ignore programmatic JS clicks — must be a trusted Playwright click.
     if (options.style) {
       const value = STYLE_VALUE_MAP[options.style];
-      await page.evaluate((val: string) => {
+      const r = await clickMatRadioByValue(page, "mat-dialog-container", value);
+      if (!r.clicked) {
+        throw new Error(`Could not select style '${options.style}' (value=${value}): ${r.reason}`);
+      }
+      // Verify the form actually accepted the selection
+      const checked = await page.evaluate((val: string) => {
         // @ts-expect-error - DOM types
-        const radios = document.querySelectorAll('mat-dialog-container mat-radio-button input[type="radio"]');
-        for (const r of radios) {
-          if ((r as any).value === val) {
-            const container = (r as any).closest('mat-radio-button');
-            (container || r as any).click();
-            return;
-          }
+        const inputs = document.querySelectorAll('mat-dialog-container mat-radio-button input[type="radio"]');
+        for (const i of inputs) {
+          if ((i as any).value === val) return (i as any).checked === true;
         }
+        return false;
       }, value);
+      if (!checked) {
+        throw new Error(`Style '${options.style}' click registered but radio not checked — Material form did not accept the change.`);
+      }
       await randomDelay(300, 500);
     }
 
     // 2. Orientation toggle
     if (options.orientation) {
       const labels = ORIENTATION_LABEL_MAP[options.orientation];
-      await page.evaluate((lbls: string[]) => {
-        // @ts-expect-error - DOM types
-        const toggles = document.querySelectorAll('mat-dialog-container mat-button-toggle');
-        for (const t of toggles) {
-          const txt = ((t as any).textContent || '').trim().toLowerCase();
-          if (lbls.some(l => txt.includes(l.toLowerCase()))) {
-            const btn = (t as any).querySelector('button, [role="button"]') || t;
-            btn.click();
-            return;
-          }
-        }
-      }, labels);
+      const r = await clickMatToggleByLabel(page, "mat-dialog-container", labels);
+      if (!r.clicked) {
+        throw new Error(`Could not select orientation '${options.orientation}': ${r.reason}`);
+      }
       await randomDelay(300, 500);
     }
 
     // 3. Language mat-select
     if (options.language) {
-      await this.selectMatSelectOption(page, options.language);
+      const r = await pickMatSelectOption(page, "mat-dialog-container", options.language);
+      if (!r.clicked) {
+        log.warning(`    Could not pick language '${options.language}': ${r.reason}`);
+      }
     }
 
-    // 4. Description textarea
+    // 4. Description textarea (textarea value setter + input event is the
+    // recommended pattern for Angular-bound textareas, and it does work —
+    // the trusted-event problem is specific to click-driven controls.)
     if (options.description && options.description.trim()) {
       await page.evaluate((text: string) => {
         // @ts-expect-error - DOM types
@@ -261,54 +270,12 @@ export class InfographicManager {
       await randomDelay(300, 500);
     }
 
-    // 5. Click Generate
-    const clicked = await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const buttons = document.querySelectorAll('mat-dialog-container button');
-      for (const b of buttons) {
-        if ((b as any).disabled) continue;
-        const text = ((b as any).textContent || '').trim();
-        const cls = ((b as any).className || '').toString();
-        if (cls.includes('mdc-button--unelevated') || cls.includes('button-color--primary')) {
-          if (/close|cancel|キャンセル|閉じる/i.test(text)) continue;
-          (b as any).click();
-          return text;
-        }
-      }
-      for (const b of buttons) {
-        const text = ((b as any).textContent || '').trim();
-        if (/^(生成|create|generate)$/i.test(text)) { (b as any).click(); return text; }
-      }
-      return '';
-    });
-    if (!clicked) throw new Error("Could not find the Generate button in customize dialog");
-    log.dim(`    Submitted customize dialog via: ${clicked}`);
-  }
-
-  private async selectMatSelectOption(page: Page, targetText: string): Promise<void> {
-    const opened = await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const sel = document.querySelector('mat-dialog-container mat-select');
-      if (!sel) return false;
-      (sel as any).click();
-      return true;
-    });
-    if (!opened) return;
-    try {
-      await page.waitForSelector('.cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]', { timeout: 5000 });
-    } catch { return; }
-    await page.evaluate((target: string) => {
-      // @ts-expect-error - DOM types
-      const opts = document.querySelectorAll('.cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]');
-      for (const o of opts) {
-        const txt = ((o as any).textContent || '').trim();
-        if (txt === target || txt.includes(target)) {
-          (o as any).click();
-          return;
-        }
-      }
-    }, targetText);
-    await randomDelay(400, 700);
+    // 5. Click Generate (Material primary action; needs trusted click)
+    const submit = await clickDialogSubmitButton(page);
+    if (!submit.clicked) {
+      throw new Error(`Could not click Generate button: ${submit.reason}`);
+    }
+    log.dim(`    Submitted customize dialog via: ${submit.buttonText ?? '<unknown>'}`);
   }
 
   private async checkInfographicStatusInternal(page: Page): Promise<InfographicStatus> {
