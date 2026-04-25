@@ -196,25 +196,36 @@ export class ResearchManager {
   }
 
   /**
-   * Click a button using Playwright's high-level locator (real event simulation)
-   * with a programmatic JS click fallback. Material/Angular handlers respond to
-   * either, but the locator path produces full pointer events which work in more
-   * edge cases.
+   * Click a button using Playwright's high-level locator (real CDP-driven
+   * pointer events with isTrusted=true). Programmatic JS .click() does NOT
+   * reliably trigger Material/Angular handlers on type=submit buttons such
+   * as the discovery dismiss button, so we don't fall through to it.
+   *
+   * Strategies, in order:
+   *   1. Standard click — Playwright's actionability checks + scrollIntoView
+   *   2. Force click — skip actionability checks, useful when an animating
+   *      sibling temporarily covers the button
    */
-  private async clickButton(page: Page, selector: string, timeout: number = 3000): Promise<boolean> {
+  private async clickButton(
+    page: Page,
+    selector: string,
+    timeout: number = 5000
+  ): Promise<{ clicked: boolean; method?: string; error?: string }> {
+    const locator = page.locator(selector).first();
     try {
-      await page.locator(selector).first().click({ timeout });
-      return true;
-    } catch {
-      // Fall through to programmatic click
+      await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      await locator.click({ timeout });
+      return { clicked: true, method: "playwright-click" };
+    } catch (e: any) {
+      const msg1 = e?.message?.split('\n')[0] ?? String(e);
+      try {
+        await locator.click({ timeout, force: true });
+        return { clicked: true, method: "playwright-force-click" };
+      } catch (e2: any) {
+        const msg2 = e2?.message?.split('\n')[0] ?? String(e2);
+        return { clicked: false, error: `click failed: ${msg1} | force: ${msg2}` };
+      }
     }
-    return await page.evaluate((s) => {
-      // @ts-expect-error - DOM types
-      const el = document.querySelector(s) as any;
-      if (!el || el.disabled) return false;
-      el.click();
-      return true;
-    }, selector);
   }
 
   /**
@@ -253,22 +264,26 @@ export class ResearchManager {
 
   /**
    * After clicking submit, confirm NotebookLM accepted the query. Signals:
-   * - Query textarea cleared (NotebookLM empties it on submit), OR
-   * - A result-section button (Import/Dismiss/Show) appeared inside the widget, OR
+   * - Submit arrow becomes disabled while the query is non-empty (NotebookLM
+   *   greys it out for the duration of the running search), OR
+   * - A result-section button (Show/Dismiss/Import) appeared inside the widget, OR
    * - A loading/progress indicator is visible inside the widget
+   * (NotebookLM does NOT clear the textarea on submit, so don't rely on that.)
    */
   private async waitForSubmitRegistered(page: Page, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const registered = await page.evaluate(() => {
         // @ts-expect-error - DOM types
-        const qb = document.querySelector('textarea.query-box-textarea') as any;
-        if (qb && (qb.value || '').length === 0) return true;
-        // @ts-expect-error - DOM types
         const dc = document.querySelector('.source-discovery-container');
         if (!dc) return false;
         if (dc.querySelector('button[jslog^="282706"], button[jslog^="282707"], button[jslog^="282708"]')) return true;
         if (dc.querySelector('[role="progressbar"], mat-spinner, mat-progress-bar, [class*="loading"], [class*="progress-"]')) return true;
+        // @ts-expect-error - DOM types
+        const qb = document.querySelector('textarea.query-box-textarea') as any;
+        // @ts-expect-error - DOM types
+        const submit = document.querySelector('button.actions-enter-button') as any;
+        if (qb && (qb.value || '').length > 0 && submit && submit.disabled) return true;
         return false;
       });
       if (registered) return true;
@@ -300,39 +315,27 @@ export class ResearchManager {
 
     log.info("  🧹 Clearing pre-existing completed discovery before new research");
 
-    // 1) Real click on Dismiss (jslog 282707, text 削除)
-    const byJslog = await this.clickButton(
-      page,
+    // Try multiple selectors. NotebookLM's class is the most stable
+    // identifier for the dismiss button — jslog ids occasionally rotate.
+    const dismissSelectors = [
+      'button.source-discovery-completed-action-delete-button',
       '.source-discovery-container button[jslog^="282707"]',
-      3000
-    );
-    if (byJslog && (await this.waitForCompletionCleared(page, 6000))) {
-      return { wasPresent: true, cleared: true, method: "dismiss-jslog" };
-    }
+    ];
 
-    // 2) Text/aria fallback (in case jslog id changes upstream)
-    const byText = await page.evaluate(() => {
-      // @ts-expect-error - DOM types
-      const buttons = document.querySelectorAll('.source-discovery-container button');
-      for (const b of buttons) {
-        const txt = ((b as any).textContent || '').trim();
-        const aria = ((b as any).getAttribute('aria-label') || '');
-        if (
-          txt === '削除' || txt.includes('削除') ||
-          aria.includes('削除') ||
-          txt === 'Dismiss' || aria.includes('Dismiss')
-        ) {
-          (b as any).click();
-          return true;
-        }
+    let lastError: string | undefined;
+    for (const sel of dismissSelectors) {
+      const result = await this.clickButton(page, sel, 8000);
+      if (!result.clicked) {
+        lastError = `${sel}: ${result.error}`;
+        continue;
       }
-      return false;
-    });
-    if (byText && (await this.waitForCompletionCleared(page, 4000))) {
-      return { wasPresent: true, cleared: true, method: "dismiss-text" };
+      if (await this.waitForCompletionCleared(page, 12000)) {
+        return { wasPresent: true, cleared: true, method: `${result.method}:${sel}` };
+      }
+      lastError = `${sel}: ${result.method} clicked but completion did not clear within 12s`;
     }
 
-    return { wasPresent: true, cleared: false };
+    return { wasPresent: true, cleared: false, method: lastError };
   }
 
   private async listSourceTitles(page: Page): Promise<string[]> {
@@ -403,11 +406,11 @@ export class ResearchManager {
         return {
           success: false, triggered: false, query: options.query,
           mode, corpus, sourcesBefore,
-          error: "A previous discovery result is blocking new research and could not be cleared automatically. Dismiss it manually in the NotebookLM UI and retry.",
+          error: `Could not clear a previous discovery result. ${cleared.method ?? ''} — Dismiss it manually in the NotebookLM UI and retry.`,
         };
       }
-      if (cleared.wasPresent && cleared.method && cleared.method !== "dismiss-jslog") {
-        log.warning(`  ⚠️  Cleared stale completion via fallback (${cleared.method}); selectors may need an update`);
+      if (cleared.wasPresent) {
+        log.info(`  ✅ Cleared stale completion (${cleared.method ?? 'ok'})`);
       }
       if (cleared.wasPresent) {
         // Give the widget a moment to settle after dismiss before typing
@@ -606,17 +609,21 @@ export class ResearchManager {
         };
       }
 
-      // Import path
-      const clicked = await this.clickButton(
-        page,
+      // Import path — try class selector first, jslog as fallback
+      const importSelectors = [
+        'button.source-discovery-completed-action-import-button',
         '.source-discovery-container button[jslog^="282708"]',
-        5000
-      );
-      if (!clicked) {
+      ];
+      let importClicked: { clicked: boolean; method?: string; error?: string } | null = null;
+      for (const sel of importSelectors) {
+        importClicked = await this.clickButton(page, sel, 8000);
+        if (importClicked.clicked) break;
+      }
+      if (!importClicked || !importClicked.clicked) {
         return {
           success: false, action, imported: false,
           sourcesBefore, sourcesAfter: sourcesBefore,
-          error: `Could not click the ${action} button.`,
+          error: `Could not click the import button (${importClicked?.error ?? 'no result'}).`,
         };
       }
 
