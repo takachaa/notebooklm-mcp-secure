@@ -323,6 +323,14 @@ class NotebookLMMCPServer {
 
       log.info(`\n🛑 Received ${signal}, shutting down gracefully...`);
 
+      // Safety net: if graceful cleanup hangs (e.g. a browser session that is
+      // already gone), force-exit so we can never linger as a CPU-spinning orphan.
+      const forceExit = setTimeout(() => {
+        log.error("⏱️ Shutdown timed out after 3s, forcing exit");
+        process.exit(1);
+      }, 3000);
+      forceExit.unref();
+
       try {
         // Cleanup tool handlers (closes all sessions)
         await this.toolHandlers.cleanup();
@@ -344,6 +352,13 @@ class NotebookLMMCPServer {
 
     process.on("SIGINT", () => requestShutdown("SIGINT"));
     process.on("SIGTERM", () => requestShutdown("SIGTERM"));
+
+    // Exit when the MCP client (parent process) disconnects and closes our
+    // stdin. Without this, a parent restart/crash that does not deliver SIGTERM
+    // leaves this server orphaned and running forever, which is exactly how
+    // hundreds of leaked instances accumulated.
+    process.stdin.on("end", () => requestShutdown("stdin-end"));
+    process.stdin.on("close", () => requestShutdown("stdin-close"));
 
     process.on("uncaughtException", (error) => {
       log.error(`💥 Uncaught exception: ${error}`);

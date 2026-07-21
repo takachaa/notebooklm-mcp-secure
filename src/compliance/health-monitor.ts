@@ -112,6 +112,8 @@ export class HealthMonitor {
     this.checkTimer = setInterval(() => {
       this.runHealthCheck().catch(() => {});
     }, this.checkIntervalSeconds * 1000);
+    // Do not let this background timer keep the process alive on its own.
+    this.checkTimer.unref();
   }
 
   /**
