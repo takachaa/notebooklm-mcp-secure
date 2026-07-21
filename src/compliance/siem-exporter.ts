@@ -123,6 +123,8 @@ export class SIEMExporter {
         // Ignore flush errors
       });
     }, this.config.flush_interval_ms);
+    // Do not let this background timer keep the process alive on its own.
+    this.flushTimer.unref();
   }
 
   /**
